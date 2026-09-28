@@ -257,7 +257,7 @@ jobs:
           set -euo pipefail
           mkdir -p ../release
           find bin/targets/x86/64 -type f \
-            \( -name '*.bin' -o -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
+            \( -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
             -o -name '*.iso' \) \
             -exec cp --parents '{}' ../release/ \;
 
