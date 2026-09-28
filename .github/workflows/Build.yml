@@ -148,7 +148,7 @@ jobs:
 
           CONFIG_FILE="package/base-files/files/bin/config_generate"
           OLD_IP="192.168.1.1"
-          NEW_IP="192.168.31.91"
+          NEW_IP="192.168.31.81"
 
           echo "Before modification:"
           grep -Fn 'lan) ipad=${ipaddr:-"192.168.1.1"} ;;' "$CONFIG_FILE"
