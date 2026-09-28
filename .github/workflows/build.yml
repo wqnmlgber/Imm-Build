@@ -6,7 +6,7 @@ on:
       version:
         description: "ImmortalWrt branch, tag, or commit (25.12.2 series: openwrt-25.12)"
         required: true
-        default: "v25.12.2"
+        default: "openwrt-25.12"
         type: string
       release:
         description: "Create a GitHub Release"
@@ -34,6 +34,23 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Check ImmortalWrt version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+      
+          echo "Checking ImmortalWrt version: ${VERSION}"
+      
+          if ! git ls-remote --exit-code --tags \
+            "${REPO_URL}" \
+            "refs/tags/${VERSION}" >/dev/null 2>&1; then
+      
+            echo "ERROR: ImmortalWrt tag '${VERSION}' does not exist!"
+            exit 1
+          fi
+
+          echo "OK: ImmortalWrt tag '${VERSION}' exists."      
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -58,7 +75,7 @@ jobs:
           git -C immortalwrt init
           git -C immortalwrt remote add origin "$REPO_URL"
 
-          # Accepts a branch, tag, or reachable commit SHA.
+          # This accepts a branch, tag, or reachable commit SHA.
           git -C immortalwrt -c protocol.version=2 fetch --depth=1 --filter=blob:none origin "$SOURCE_REF"
           git -C immortalwrt checkout --detach FETCH_HEAD
 
@@ -111,11 +128,11 @@ jobs:
           fi
 
           cp .config immortalwrt/.config
-
           if ! grep -qx 'CONFIG_CCACHE=y' immortalwrt/.config; then
             echo "WARNING: CONFIG_CCACHE=y is absent from .config; ccache will not accelerate this build."
           fi
 
+          echo "Selected target packages:"
           grep -E 'CONFIG_TARGET_|CONFIG_DEFAULT_TARGET_|CONFIG_PACKAGE_luci|CONFIG_PACKAGE_kmod' \
             immortalwrt/.config | head -100 || true
 
@@ -123,6 +140,7 @@ jobs:
         working-directory: immortalwrt
         run: |
           make defconfig
+          echo "Target configuration:"
           grep '^CONFIG_TARGET_' .config | head -50 || true
 
       - name: Clean build directory
@@ -139,6 +157,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          echo "Starting ImmortalWrt build with $(nproc) CPU cores."
           make -j"$(nproc)" world 2>&1 | tee build.log
 
       - name: Retry failed build with verbose output
@@ -147,6 +166,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          echo "Parallel build failed; retrying with one job and verbose output."
           make -j1 V=s 2>&1 | tee build-retry.log
 
       - name: Show build information
@@ -194,7 +214,6 @@ jobs:
             \( -name '*.bin' -o -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
             -o -name '*.manifest' -o -name 'sha256sums' \) \
             -exec cp --parents '{}' ../release/ \;
-
           {
             echo "Requested source: $SOURCE_REF"
             echo "Resolved version: $SOURCE_VERSION"
