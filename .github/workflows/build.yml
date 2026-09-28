@@ -1,61 +1,61 @@
-name: Build ImmortalWrt
+name: Build ImmortalWrt 
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "ImmortalWrt branch, tag, or commit (25.12.2 series: openwrt-25.12)"
-        required: true
-        default: "openwrt-25.12"
-        type: string
-      release:
-        description: "Create a GitHub Release"
+      force:
+        description: 'Force build and release even if the latest version already exists'
         required: true
         default: false
         type: boolean
+
       clean:
-        description: "Run make clean before compiling"
+        description: 'Run make clean before building'
         required: true
         default: false
         type: boolean
+
+  schedule:
+    # Every Monday at 02:17 UTC
+    - cron: '17 2 * * 1'
+
+
+permissions:
+  contents: write
+
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  TARGET_DIR: immortalwrt/bin/targets/x86/64
+
 
 jobs:
+
   build:
+
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - name: Checkout configuration repository
+
+      # ============================================================
+      # 1. Checkout your build configuration repository
+      # ============================================================
+
+      - name: Checkout build configuration
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Check ImmortalWrt version
-        shell: bash
-        run: |
-          VERSION="${{ inputs.version }}"
-      
-          echo "Checking ImmortalWrt version: ${VERSION}"
-      
-          if ! git ls-remote --exit-code --tags \
-            "${REPO_URL}" \
-            "refs/tags/${VERSION}" >/dev/null 2>&1; then
-      
-            echo "ERROR: ImmortalWrt tag '${VERSION}' does not exist!"
-            exit 1
-          fi
 
-          echo "OK: ImmortalWrt tag '${VERSION}' exists."      
+      # ============================================================
+      # 2. Install build dependencies
+      # ============================================================
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
             bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
             g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
             libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
@@ -64,175 +64,564 @@ jobs:
             python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
 
-      - name: Clone requested ImmortalWrt source
-        id: source
-        env:
-          SOURCE_REF: ${{ inputs.version }}
+
+      # ============================================================
+      # 3. Automatically find latest ImmortalWrt 25.12.x
+      # ============================================================
+
+      - name: Resolve latest ImmortalWrt v25.12.x
+        id: resolve
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir immortalwrt
-          git -C immortalwrt init
-          git -C immortalwrt remote add origin "$REPO_URL"
+          echo "========================================"
+          echo "Searching latest ImmortalWrt v25.12.x"
+          echo "========================================"
 
-          # This accepts a branch, tag, or reachable commit SHA.
-          git -C immortalwrt -c protocol.version=2 fetch --depth=1 --filter=blob:none origin "$SOURCE_REF"
-          git -C immortalwrt checkout --detach FETCH_HEAD
+          LATEST_TAG="$(
+            git ls-remote --tags --refs "$REPO_URL" \
+              | awk -F/ '{print $3}' \
+              | grep -E '^v25\.12\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )"
 
-          SOURCE_COMMIT="$(git -C immortalwrt rev-parse HEAD)"
-          SOURCE_VERSION="$(git -C immortalwrt describe --tags --always)"
-          REF_SLUG="$(printf '%s' "$SOURCE_REF" | tr -cs 'A-Za-z0-9._-' '-' | sed -e 's/^-*//' -e 's/-*$//')"
-          REF_SLUG="${REF_SLUG:-source}"
-
-          {
-            echo "commit=$SOURCE_COMMIT"
-            echo "display_version=$SOURCE_VERSION"
-            echo "ref_slug=$REF_SLUG"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "Requested source: $SOURCE_REF"
-          echo "Resolved version: $SOURCE_VERSION"
-          echo "Resolved commit: $SOURCE_COMMIT"
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: immortalwrt-ccache-${{ runner.os }}-${{ steps.source.outputs.ref_slug }}-${{ hashFiles('.config') }}
-          restore-keys: |
-            immortalwrt-ccache-${{ runner.os }}-${{ steps.source.outputs.ref_slug }}-
-
-      - name: Configure ccache
-        run: |
-          mkdir -p ~/.ccache
-          ccache --set-config=cache_dir="$HOME/.ccache"
-          ccache --set-config=max_size=5G
-          ccache --set-config=compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-          ccache -z
-
-      - name: Update feeds
-        working-directory: immortalwrt
-        run: ./scripts/feeds update -a
-
-      - name: Install feeds
-        working-directory: immortalwrt
-        run: ./scripts/feeds install -a
-
-      - name: Copy configuration
-        run: |
-          set -euo pipefail
-          if [ ! -f .config ]; then
-            echo "ERROR: .config was not found in the configuration repository."
+          if [ -z "$LATEST_TAG" ]; then
+            echo "ERROR: No v25.12.x tag found."
             exit 1
           fi
 
-          cp .config immortalwrt/.config
-          if ! grep -qx 'CONFIG_CCACHE=y' immortalwrt/.config; then
-            echo "WARNING: CONFIG_CCACHE=y is absent from .config; ccache will not accelerate this build."
+          echo "Latest version: $LATEST_TAG"
+
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 4. Check whether this version has already been released
+      # ============================================================
+
+      - name: Check existing release
+        id: check_release
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="immortalwrt-${VERSION}"
+
+          echo "Checking release: ${RELEASE_TAG}"
+
+          if [ "$FORCE" = "true" ]; then
+
+            echo "Force build enabled."
+
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
           fi
 
-          echo "Selected target packages:"
-          grep -E 'CONFIG_TARGET_|CONFIG_DEFAULT_TARGET_|CONFIG_PACKAGE_luci|CONFIG_PACKAGE_kmod' \
-            immortalwrt/.config | head -100 || true
+
+          if git ls-remote --tags \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/${RELEASE_TAG}" \
+              | grep -q "$RELEASE_TAG"; then
+
+            echo "Release already exists:"
+            echo "$RELEASE_TAG"
+
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "New version detected:"
+            echo "$VERSION"
+
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # ============================================================
+      # 5. Stop if this version already exists
+      # ============================================================
+
+      - name: Skip already released version
+        if: steps.check_release.outputs.should_build != 'true'
+        run: |
+          echo "========================================"
+          echo "No new ImmortalWrt 25.12.x version."
+          echo "Build skipped."
+          echo "========================================"
+
+
+      # ============================================================
+      # 6. Clone exact ImmortalWrt release tag
+      # ============================================================
+
+      - name: Clone ImmortalWrt
+        if: steps.check_release.outputs.should_build == 'true'
+        id: source
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Cloning ImmortalWrt ${VERSION}"
+
+          git clone \
+            --branch "$VERSION" \
+            --single-branch \
+            --filter=blob:none \
+            "$REPO_URL" \
+            immortalwrt
+
+          cd immortalwrt
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          SOURCE_VERSION="$(git describe --tags --always)"
+
+          echo "========================================"
+          echo "Source version: ${SOURCE_VERSION}"
+          echo "Source commit : ${SOURCE_COMMIT}"
+          echo "========================================"
+
+          echo "commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 7. Restore ccache
+      # ============================================================
+
+      - name: Restore ccache
+        if: steps.check_release.outputs.should_build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: immortalwrt-25.12-${{ steps.resolve.outputs.tag }}-${{ hashFiles('.config') }}
+
+          restore-keys: |
+            immortalwrt-25.12-${{ steps.resolve.outputs.tag }}-
+            immortalwrt-25.12-
+
+
+      # ============================================================
+      # 8. Configure ccache
+      # ============================================================
+
+      - name: Configure ccache
+        if: steps.check_release.outputs.should_build == 'true'
+        run: |
+          mkdir -p "$HOME/.ccache"
+
+          ccache --set-config=max_size=5G
+          ccache --set-config=compression=true
+
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+
+          ccache -z
+
+
+      # ============================================================
+      # 9. Update feeds
+      # ============================================================
+
+      - name: Update feeds
+        if: steps.check_release.outputs.should_build == 'true'
+        working-directory: immortalwrt
+        run: |
+          ./scripts/feeds update -a
+
+
+      # ============================================================
+      # 10. Install feeds
+      # ============================================================
+
+      - name: Install feeds
+        if: steps.check_release.outputs.should_build == 'true'
+        working-directory: immortalwrt
+        run: |
+          ./scripts/feeds install -a
+
+
+      # ============================================================
+      # 11. Copy .config
+      # ============================================================
+
+      - name: Copy .config
+        if: steps.check_release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f ".config" ]; then
+
+            echo "ERROR: .config not found."
+
+            exit 1
+
+          fi
+
+          cp .config immortalwrt/.config
+
+          echo "========================================"
+          echo "Custom configuration copied."
+          echo "========================================"
+
+
+      # ============================================================
+      # 12. Generate final configuration
+      # ============================================================
 
       - name: Generate final configuration
+        if: steps.check_release.outputs.should_build == 'true'
         working-directory: immortalwrt
         run: |
+          set -euo pipefail
+
           make defconfig
-          echo "Target configuration:"
+
+          echo "========================================"
+          echo "Target configuration"
+          echo "========================================"
+
           grep '^CONFIG_TARGET_' .config | head -50 || true
 
-      - name: Clean build directory
-        if: ${{ inputs.clean }}
+
+          # Verify x86 target
+
+          if ! grep -q '^CONFIG_TARGET_x86=y' .config; then
+
+            echo "ERROR: CONFIG_TARGET_x86=y not found."
+
+            exit 1
+
+          fi
+
+
+          # Verify x86_64 target
+
+          if ! grep -q '^CONFIG_TARGET_x86_64=y' .config; then
+
+            echo "ERROR: CONFIG_TARGET_x86_64=y not found."
+
+            exit 1
+
+          fi
+
+
+          echo "========================================"
+          echo "x86_64 target verified."
+          echo "========================================"
+
+
+      # ============================================================
+      # 13. Optional clean build
+      # ============================================================
+
+      - name: Clean build
+        if: steps.check_release.outputs.should_build == 'true' && inputs.clean == true
         working-directory: immortalwrt
-        run: make clean
+        run: |
+          make clean
+
+
+      # ============================================================
+      # 14. Download source packages
+      # ============================================================
 
       - name: Download sources
+        if: steps.check_release.outputs.should_build == 'true'
         working-directory: immortalwrt
-        run: make download -j"$(nproc)" V=s
+        run: |
+          make download -j"$(nproc)" V=s
+
+
+      # ============================================================
+      # 15. Build firmware
+      # ============================================================
 
       - name: Build firmware
+        if: steps.check_release.outputs.should_build == 'true'
         working-directory: immortalwrt
         shell: bash
         run: |
           set -o pipefail
-          echo "Starting ImmortalWrt build with $(nproc) CPU cores."
+
+          echo "========================================"
+          echo "Starting ImmortalWrt build"
+          echo "CPU cores: $(nproc)"
+          echo "========================================"
+
           make -j"$(nproc)" world 2>&1 | tee build.log
 
-      - name: Retry failed build with verbose output
-        if: failure()
+
+      # ============================================================
+      # 16. Retry failed build
+      # ============================================================
+
+      - name: Retry build with verbose output
+        if: failure() && steps.check_release.outputs.should_build == 'true'
         working-directory: immortalwrt
         shell: bash
         run: |
           set -o pipefail
-          echo "Parallel build failed; retrying with one job and verbose output."
+
+          echo "========================================"
+          echo "Parallel build failed."
+          echo "Retrying with -j1 V=s"
+          echo "========================================"
+
           make -j1 V=s 2>&1 | tee build-retry.log
 
-      - name: Show build information
-        if: always()
-        working-directory: immortalwrt
-        run: |
-          df -h
-          ccache -s || true
-          test ! -f build.log || tail -100 build.log
-          find bin/targets -type f \
-            \( -name '*.bin' -o -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
-            -o -name '*.manifest' -o -name 'sha256sums' \) -print 2>/dev/null || true
 
-      - name: Upload build logs
-        if: always()
+      # ============================================================
+      # 17. Verify exact release files
+      # ============================================================
+
+      - name: Verify release files
+        if: success() && steps.check_release.outputs.should_build == 'true'
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_DIR="bin/targets/x86/64"
+
+          FILES=(
+
+            "immortalwrt-x86-64-generic-image-efi.iso"
+
+            "immortalwrt-x86-64-generic-ext4-combined-efi.vmdk.gz"
+
+            "immortalwrt-x86-64-generic-ext4-combined-efi.img.gz"
+
+          )
+
+
+          echo "========================================"
+          echo "Checking generated files"
+          echo "Directory: $TARGET_DIR"
+          echo "========================================"
+
+
+          for FILE in "${FILES[@]}"; do
+
+            if [ ! -f "$TARGET_DIR/$FILE" ]; then
+
+              echo "ERROR: Missing:"
+              echo "$TARGET_DIR/$FILE"
+
+              exit 1
+
+            fi
+
+            echo "OK: $TARGET_DIR/$FILE"
+
+            ls -lh "$TARGET_DIR/$FILE"
+
+          done
+
+
+      # ============================================================
+      # 18. Prepare Release files
+      # ============================================================
+
+      - name: Prepare release
+        if: success() && steps.check_release.outputs.should_build == 'true'
+        working-directory: immortalwrt
+        env:
+          VERSION: ${{ steps.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          SOURCE_VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_DIR="bin/targets/x86/64"
+          RELEASE_DIR="../release"
+
+          mkdir -p "$RELEASE_DIR"
+
+
+          # --------------------------------------------------------
+          # Copy exactly three firmware files
+          # --------------------------------------------------------
+
+          FILES=(
+
+            "immortalwrt-x86-64-generic-image-efi.iso"
+
+            "immortalwrt-x86-64-generic-ext4-combined-efi.vmdk.gz"
+
+            "immortalwrt-x86-64-generic-ext4-combined-efi.img.gz"
+
+          )
+
+
+          for FILE in "${FILES[@]}"; do
+
+            cp \
+              "$TARGET_DIR/$FILE" \
+              "$RELEASE_DIR/ImmortalWrt-${VERSION}-${FILE}"
+
+          done
+
+
+          cd "$RELEASE_DIR"
+
+
+          # --------------------------------------------------------
+          # Generate SHA256
+          # --------------------------------------------------------
+
+          sha256sum \
+            "ImmortalWrt-${VERSION}-immortalwrt-x86-64-generic-image-efi.iso" \
+            "ImmortalWrt-${VERSION}-immortalwrt-x86-64-generic-ext4-combined-efi.vmdk.gz" \
+            "ImmortalWrt-${VERSION}-immortalwrt-x86-64-generic-ext4-combined-efi.img.gz" \
+            > SHA256SUMS
+
+
+          # --------------------------------------------------------
+          # Generate build information
+          # --------------------------------------------------------
+
+          {
+            echo "ImmortalWrt Version: $VERSION"
+            echo "Source Version: $SOURCE_VERSION"
+            echo "Source Commit: $SOURCE_COMMIT"
+            echo "Target: x86_64"
+            echo "Target Directory: bin/targets/x86/64"
+            echo "Configuration Repository: $GITHUB_REPOSITORY"
+            echo "Configuration Commit: $GITHUB_SHA"
+            echo "GitHub Actions Run: $GITHUB_RUN_NUMBER"
+            echo "Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > build-info.txt
+
+
+          echo "========================================"
+          echo "Release files"
+          echo "========================================"
+
+          ls -lh "$RELEASE_DIR"
+
+
+      # ============================================================
+      # 19. Upload firmware Artifact
+      # ============================================================
+
+      - name: Upload firmware artifact
+        if: success() && steps.check_release.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ github.run_number }}
+          name: ImmortalWrt-${{ steps.resolve.outputs.tag }}-x86-64
+          path: |
+            release/**
+          if-no-files-found: error
+          retention-days: 14
+
+
+      # ============================================================
+      # 20. Upload build logs
+      # ============================================================
+
+      - name: Upload build logs
+        if: always() && steps.check_release.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-${{ steps.resolve.outputs.tag }}-build-logs
           path: |
             immortalwrt/build.log
             immortalwrt/build-retry.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
 
-      - name: Upload firmware
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImmortalWrt-${{ steps.source.outputs.ref_slug }}-${{ github.run_number }}
-          path: immortalwrt/bin/targets/**
-          if-no-files-found: error
-          retention-days: 7
 
-      - name: Prepare release files
-        if: ${{ success() && inputs.release }}
+      # ============================================================
+      # 21. Show build statistics
+      # ============================================================
+
+      - name: Show build statistics
+        if: always() && steps.check_release.outputs.should_build == 'true'
         working-directory: immortalwrt
-        env:
-          SOURCE_REF: ${{ inputs.version }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
-          SOURCE_VERSION: ${{ steps.source.outputs.display_version }}
         run: |
-          set -euo pipefail
-          mkdir -p ../release
-          find bin/targets -type f \
-            \( -name '*.bin' -o -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
-            -o -name '*.manifest' -o -name 'sha256sums' \) \
-            -exec cp --parents '{}' ../release/ \;
-          {
-            echo "Requested source: $SOURCE_REF"
-            echo "Resolved version: $SOURCE_VERSION"
-            echo "ImmortalWrt commit: $SOURCE_COMMIT"
-            echo "Configuration repository commit: $GITHUB_SHA"
-            echo "Build date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          } > ../release/build-info.txt
+          echo "========================================"
+          echo "Disk usage"
+          echo "========================================"
+
+          df -h
+
+
+          echo ""
+          echo "========================================"
+          echo "ccache statistics"
+          echo "========================================"
+
+          ccache -s || true
+
+
+          echo ""
+          echo "========================================"
+          echo "Generated x86/64 files"
+          echo "========================================"
+
+          find bin/targets/x86/64 \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort || true
+
+
+      # ============================================================
+      # 22. Create GitHub Release
+      # ============================================================
 
       - name: Create GitHub Release
-        if: ${{ success() && inputs.release }}
+        if: success() && steps.check_release.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: immortalwrt-${{ steps.source.outputs.ref_slug }}-run-${{ github.run_number }}
-          name: ImmortalWrt ${{ steps.source.outputs.ref_slug }} Build ${{ github.run_number }}
-          body: |
-            ## ImmortalWrt Build
+          tag_name: immortalwrt-${{ steps.resolve.outputs.tag }}
+          name: ImmortalWrt ${{ steps.resolve.outputs.tag }} x86-64
 
-            - Requested source: `${{ inputs.version }}`
-            - Resolved source commit: `${{ steps.source.outputs.commit }}`
-            - Configuration repository commit: `${{ github.sha }}`
-            - Build run: `${{ github.run_number }}`
-          files: release/**
+          generate_release_notes: false
+
+          body: |
+            ## ImmortalWrt ${{ steps.resolve.outputs.tag }} — x86-64
+
+            Automatically built from the ImmortalWrt 25.12.x release tag.
+
+            ### Source
+
+            - Version: `${{ steps.resolve.outputs.tag }}`
+            - Commit: `${{ steps.source.outputs.commit }}`
+
+            ### Target
+
+            - Architecture: `x86_64`
+            - Target directory: `bin/targets/x86/64`
+
+            ### Included firmware
+
+            - Generic EFI ISO
+            - Generic EFI VMDK
+            - Generic EFI ext4 IMG
+
+            ### Checksums
+
+            SHA256 checksums are provided in `SHA256SUMS`.
+
+            Build information is provided in `build-info.txt`.
+
+          files: |
+            release/ImmortalWrt-${{ steps.resolve.outputs.tag }}-immortalwrt-x86-64-generic-image-efi.iso
+            release/ImmortalWrt-${{ steps.resolve.outputs.tag }}-immortalwrt-x86-64-generic-ext4-combined-efi.vmdk.gz
+            release/ImmortalWrt-${{ steps.resolve.outputs.tag }}-immortalwrt-x86-64-generic-ext4-combined-efi.img.gz
+            release/SHA256SUMS
+            release/build-info.txt
+
+          fail_on_unmatched_files: true
