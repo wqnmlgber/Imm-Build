@@ -222,7 +222,7 @@ jobs:
           df -h
           ccache -s || true
           test ! -f build.log || tail -100 build.log
-          find bin/targets -type f \
+          find bin/targets/x86/64 -type f \
             \( -name '*.img' -o -name '*.vmdk' -o -name '*.gz' \
             -o -name '*.iso' \) -print 2>/dev/null || true
 
